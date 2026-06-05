@@ -403,32 +403,21 @@ class ParameterServerCoordinator:
                 shard_initial = initial_params[start_idx:end_idx]
             
             if self.distributed:
-                # MODO DISTRIBUIDO: cada shard escucha en un puerto TCP
+                # MODO DISTRIBUIDO: el shard escucha en TCP
                 shard_port = self.base_port + shard_id
                 
-                # Colas locales para este shard
-                local_request_queue = queue.Queue()
-                local_response_queues: Dict[int, Queue] = {}
-                self.per_shard_response_queues[shard_id] = local_response_queues
-                
-                # Crear listener TCP
-                listener = ParameterServerListener(
-                    host=self.host,
-                    port=shard_port,
-                    request_queue=local_request_queue,
-                    response_queues=local_response_queues
-                )
-                listener.start()
-                
-                # El shard process lee de la cola local
+                # FIX: No crear listener ni colas en el proceso padre.
+                # En Windows con spawn(), queue.Queue y ParameterServerListener
+                # contienen locks que NO se pueden pickle.
+                # El listener y las colas se crean DENTRO del proceso hijo.
                 p = mp.Process(
                     target=parameter_server_shard_process,
                     args=(
                         shard_id,
-                        local_request_queue,  # Cola local
-                        local_response_queues,  # Colas locales
-                        None,  # No listener en el proceso (ya está aquí)
-                        None,
+                        None,  # request_queue: se crea en el hijo
+                        None,  # response_queues: se crea en el hijo
+                        self.host,     # listener_host: el hijo crea el listener
+                        shard_port,    # listener_port
                         self.should_stop,
                         self.config_dict,
                         self.total_params,
