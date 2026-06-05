@@ -1,17 +1,14 @@
 """
 Parameter Server con Sharding y Adagrad.
 
-Implementa el Parameter Server central descrito en el paper:
-"We divide the training data into a number of subsets and run a copy 
-of the model on each of these subsets. The models communicate updates 
-through a centralized parameter server, which keeps the current state 
-of all parameters for the model, sharded across many machines"
+Soporta dos modos de operación:
+- LOCAL: multiprocessing.Queue (todo en una máquina)
+- DISTRIBUIDO: TCP/IP (PS en una máquina, réplicas en otras)
 
-Características implementadas:
-- Sharding de parámetros entre múltiples shards
-- Adagrad adaptativo por parámetro
-- Operaciones asíncronas de GET y PUSH
-- Checkpointing
+Implementa el Parameter Server central descrito en el paper:
+"The models communicate updates through a centralized parameter server,
+which keeps the current state of all parameters for the model, sharded
+across many machines"
 """
 
 import torch
@@ -24,12 +21,17 @@ import time
 import os
 import pickle
 import logging
+import threading
 
 from utils import (
     Message, MessageType,
     get_parameter_shard_bounds
 )
 from config import ParameterServerConfig
+from networking import (
+    ParameterServerListener, _send_message, _recv_message,
+    get_local_ip
+)
 
 
 logger = logging.getLogger("ParameterServer")
@@ -50,30 +52,17 @@ class ParameterShard:
     
     def __init__(self, shard_id: int, start_idx: int, end_idx: int,
                  config: ParameterServerConfig):
-        """
-        Args:
-            shard_id: ID único del shard
-            start_idx: Índice inicial de los parámetros (global)
-            end_idx: Índice final de los parámetros (global)
-            config: Configuración del PS
-        """
         self.shard_id = shard_id
         self.start_idx = start_idx
         self.end_idx = end_idx
         self.config = config
         self.size = end_idx - start_idx
         
-        # Parámetros almacenados en este shard (inicializados luego)
         self.parameters = None
         
-        # Estado de Adagrad: suma acumulada de gradientes cuadrados
-        # η_{i,K} = γ / sqrt(Σ_{j=1}^{K} Δw_{i,j}^2)
-        # Según el paper: "Adagrad uses a separate adaptive learning rate 
-        # for each parameter... these learning rates are computed only from 
-        # the summed squared gradients of each parameter"
+        # Estado de Adagrad: η_{i,K} = γ / sqrt(Σ Δw_{i,j}^2)
         self.accumulated_squared_gradients = None
         
-        # Contadores de updates
         self.num_updates = 0
         self.num_get_requests = 0
         
@@ -84,18 +73,11 @@ class ParameterShard:
         )
     
     def initialize_parameters(self, initial_values: torch.Tensor):
-        """
-        Inicializa los parámetros con valores dados.
-        
-        Args:
-            initial_values: Tensor con los valores iniciales para este shard
-        """
+        """Inicializa los parámetros con valores dados."""
         assert len(initial_values) == self.size, \
             f"Tamaño mismatch: {len(initial_values)} vs {self.size}"
         
         self.parameters = initial_values.clone()
-        
-        # Inicializar acumuladores de Adagrad en cero
         self.accumulated_squared_gradients = torch.zeros(self.size)
         
         self.logger.info(
@@ -103,12 +85,7 @@ class ParameterShard:
         )
     
     def get_parameters(self) -> torch.Tensor:
-        """
-        Retorna los parámetros actuales de este shard.
-        
-        Returns:
-            Tensor con los parámetros [start_idx:end_idx]
-        """
+        """Retorna los parámetros actuales de este shard."""
         self.num_get_requests += 1
         return self.parameters.clone()
     
@@ -119,29 +96,21 @@ class ParameterShard:
         Según el paper (Sección 4.1):
         - Adagrad: η_{i,K} = γ / sqrt(Σ_{j=1}^{K} Δw_{i,j}^2)
         - "Adagrad is easily implemented locally within each parameter server shard"
-        
-        Args:
-            gradients: Gradientes para los parámetros de este shard
         """
         assert len(gradients) == self.size, \
             f"Tamaño de gradientes mismatch: {len(gradients)} vs {self.size}"
         
         if self.config.use_adagrad:
             # Adagrad adaptativo
-            # Actualizar acumulador de gradientes cuadrados
             self.accumulated_squared_gradients += gradients ** 2
             
-            # Calcular learning rate adaptativo por parámetro
-            # η_i = γ / sqrt(accumulated_g² + ε)
             adaptive_lr = self.config.adagrad_gamma / (
                 torch.sqrt(self.accumulated_squared_gradients) + 
                 self.config.adagrad_epsilon
             )
             
-            # Aplicar update: w = w - η * gradient
             self.parameters -= adaptive_lr * gradients
         else:
-            # SGD con learning rate fijo
             self.parameters -= self.config.base_learning_rate * gradients
         
         self.num_updates += 1
@@ -160,8 +129,10 @@ class ParameterShard:
 
 def parameter_server_shard_process(
     shard_id: int,
-    request_queue: Queue,
-    response_queue: Queue,
+    request_queue: Optional[Queue],
+    response_queues: Optional[Dict[int, Queue]],
+    listener_host: Optional[str],
+    listener_port: Optional[int],
     should_stop,
     config_dict: dict,
     total_params: int,
@@ -170,19 +141,21 @@ def parameter_server_shard_process(
     """
     Proceso para un shard del Parameter Server.
     
-    Este proceso corre de forma independiente, escuchando requests
-    de las model replicas y respondiendo de forma asíncrona.
+    Funciona en dos modos:
+    - LOCAL: request_queue y response_queues son multiprocessing.Queue
+    - DISTRIBUIDO: listener_host/port especifican dónde escuchar TCP
     
     Args:
         shard_id: ID del shard
-        request_queue: Cola para recibir requests
-        response_queue: Cola para enviar responses
+        request_queue: Cola para recibir requests (modo local) o None
+        response_queues: Dict de colas para enviar responses (modo local) o None
+        listener_host: Host para escuchar TCP (modo distribuido) o None
+        listener_port: Puerto TCP (modo distribuido) o None
         should_stop: Value compartido para señal de parada
         config_dict: Configuración serializada como dict
         total_params: Número total de parámetros del modelo
-        initial_parameters: Parámetros iniciales (si None, se inicializan en cero)
+        initial_parameters: Parámetros iniciales
     """
-    # Recrear configuración desde dict
     config = ParameterServerConfig(**config_dict)
     
     logger.info(f"Iniciando PS shard {shard_id}")
@@ -203,19 +176,41 @@ def parameter_server_shard_process(
     
     shard.initialize_parameters(shard_params)
     
+    # --- MODO DISTRIBUIDO: escuchar conexiones TCP ---
+    tcp_listener = None
+    if listener_host is not None and listener_port is not None:
+        # Cola local para requests de réplicas conectadas vía TCP
+        local_request_queue = queue.Queue()
+        local_response_queues: Dict[int, queue.Queue] = {}
+        
+        tcp_listener = ParameterServerListener(
+            host=listener_host,
+            port=listener_port,
+            request_queue=local_request_queue,
+            response_queues=local_response_queues
+        )
+        tcp_listener.start()
+        
+        # Usar las colas locales como fuente/sink
+        request_queue = local_request_queue
+        response_queues = local_response_queues
+        
+        logger.info(f"PS shard {shard_id} escuchando en TCP {listener_host}:{listener_port}")
+    
     logger.info(f"PS shard {shard_id} listo para procesar requests")
     
     # Loop principal: procesar requests de forma asíncrona
     while not should_stop.value:
         try:
-            # Recibir request de una replica (blocking con timeout)
+            # Recibir request (blocking con timeout)
             try:
                 msg = request_queue.get(block=True, timeout=0.5)
             except queue.Empty:
                 continue
             
+            sender_id = getattr(msg, 'sender_id', -1)
+            
             if msg.msg_type == MessageType.GET_PARAMETERS:
-                # Responder con los parámetros actuales
                 params = shard.get_parameters()
                 response = Message(
                     msg_type=MessageType.PARAMETERS_RESPONSE,
@@ -227,36 +222,52 @@ def parameter_server_shard_process(
                         'parameters': params
                     }
                 )
-                response_queue.put(response)
+                
+                # Enviar response al sender correcto
+                if sender_id in response_queues:
+                    try:
+                        response_queues[sender_id].put(response, block=False)
+                    except queue.Full:
+                        pass
+                elif response_queues:
+                    # Fallback: enviar a la primera cola disponible
+                    try:
+                        next(iter(response_queues.values())).put(response, block=False)
+                    except queue.Full:
+                        pass
                 
             elif msg.msg_type == MessageType.PUSH_GRADIENTS:
-                # Aplicar gradientes
                 grad_data = msg.data
                 gradients = grad_data['gradients']
-                
-                # Aplicar al shard
                 shard.apply_gradients(gradients)
                 
-                # Acknowledge
                 ack = Message(
                     msg_type=MessageType.GRADIENTS_ACK,
                     sender_id=shard_id,
                     data={'shard_id': shard_id, 'status': 'applied'}
                 )
-                response_queue.put(ack)
+                
+                if sender_id in response_queues:
+                    try:
+                        response_queues[sender_id].put(ack, block=False)
+                    except queue.Full:
+                        pass
                 
             elif msg.msg_type == MessageType.GET_STATS:
-                # Enviar estadísticas
                 stats = shard.get_stats()
                 response = Message(
                     msg_type=MessageType.STATS_RESPONSE,
                     sender_id=shard_id,
                     data=stats
                 )
-                response_queue.put(response)
+                
+                if sender_id in response_queues:
+                    try:
+                        response_queues[sender_id].put(response, block=False)
+                    except queue.Full:
+                        pass
                 
             elif msg.msg_type == MessageType.SAVE_CHECKPOINT:
-                # Guardar checkpoint
                 checkpoint_data = {
                     'shard_id': shard_id,
                     'parameters': shard.parameters.clone(),
@@ -277,10 +288,14 @@ def parameter_server_shard_process(
                     sender_id=shard_id,
                     data={'filepath': filepath}
                 )
-                response_queue.put(ack)
+                
+                if sender_id in response_queues:
+                    try:
+                        response_queues[sender_id].put(ack, block=False)
+                    except queue.Full:
+                        pass
                 
             elif msg.msg_type == MessageType.LOAD_CHECKPOINT:
-                # Cargar checkpoint
                 filepath = os.path.join(
                     config.checkpoint_dir,
                     f"shard_{shard_id}_checkpoint.pkl"
@@ -298,10 +313,19 @@ def parameter_server_shard_process(
                     sender_id=shard_id,
                     data={'loaded': os.path.exists(filepath)}
                 )
-                response_queue.put(ack)
+                
+                if sender_id in response_queues:
+                    try:
+                        response_queues[sender_id].put(ack, block=False)
+                    except queue.Full:
+                        pass
                 
         except Exception as e:
             logger.error(f"Error en PS shard {shard_id}: {e}")
+    
+    # Cleanup
+    if tcp_listener:
+        tcp_listener.stop()
     
     logger.info(f"PS shard {shard_id} detenido. "
                 f"Updates procesados: {shard.num_updates}")
@@ -311,26 +335,40 @@ class ParameterServerCoordinator:
     """
     Coordinador del Parameter Server.
     
-    Gestiona múltiples shards del PS y provee una interfaz unificada
-    para las model replicas.
+    Soporta lanzar todos los shards en local, o un subconjunto de shards
+    distribuidos en múltiples máquinas.
     """
     
-    def __init__(self, config: ParameterServerConfig, total_params: int):
+    def __init__(self, config: ParameterServerConfig, total_params: int,
+                 distributed: bool = False, host: str = "0.0.0.0", base_port: int = 29500,
+                 shards_to_launch: Optional[List[int]] = None):
         """
         Args:
             config: Configuración del PS
             total_params: Número total de parámetros
+            distributed: Si usar TCP en vez de Queue
+            host: Host para escuchar (modo distribuido)
+            base_port: Puerto base (modo distribuido)
+            shards_to_launch: Lista de shard IDs a lanzar. 
+                             None = todos (modo local).
+                             [0], [1], ... = solo ese shard (modo distribuido).
         """
         self.config = config
         self.total_params = total_params
+        self.distributed = distributed
+        self.host = host
+        self.base_port = base_port
+        self.shards_to_launch = shards_to_launch if shards_to_launch is not None else list(range(config.num_shards))
         
-        # Crear colas de comunicación en el proceso principal
+        # Colas de comunicación (una por shard total del sistema)
         self.request_queues = [Queue() for _ in range(config.num_shards)]
         self.response_queue = Queue()
         self.should_stop = mp.Value('b', False)
         self.shard_processes = []
         
-        # Serializar configuración para pasar a los procesos
+        # En modo distribuido, cada shard lanzado tiene su propia cola de responses por réplica
+        self.per_shard_response_queues: Dict[int, Dict[int, Queue]] = {}
+        
         self.config_dict = {
             'num_shards': config.num_shards,
             'base_port': config.base_port,
@@ -343,57 +381,108 @@ class ParameterServerCoordinator:
         }
         
         logger.info(
-            f"PS Coordinator inicializado: "
-            f"{config.num_shards} shards, "
-            f"{total_params:,} parámetros totales"
+            f"PS Coordinator: {config.num_shards} shards totales, "
+            f"lanzando: {self.shards_to_launch}, "
+            f"{total_params:,} params, "
+            f"modo: {'DISTRIBUIDO' if distributed else 'LOCAL'}"
         )
     
     def start(self, initial_model_state: Optional[Dict] = None):
-        """
-        Inicia los procesos de los shards.
-        
-        Args:
-            initial_model_state: Estado inicial del modelo (opcional)
-        """
-        # Extraer parámetros iniciales si se proporcionan
+        """Inicia los procesos de los shards especificados en shards_to_launch."""
         initial_params = None
         if initial_model_state is not None:
             initial_params = initial_model_state.get('parameters')
         
-        # Crear y lanzar procesos para cada shard
-        for shard_id in range(self.config.num_shards):
+        for shard_id in self.shards_to_launch:
             start_idx, end_idx = get_parameter_shard_bounds(
                 self.total_params, self.config.num_shards, shard_id
             )
             
-            # Preparar parámetros iniciales para este shard
             shard_initial = None
             if initial_params is not None:
                 shard_initial = initial_params[start_idx:end_idx]
             
-            p = mp.Process(
-                target=parameter_server_shard_process,
-                args=(
-                    shard_id, 
-                    self.request_queues[shard_id],
-                    self.response_queue,
-                    self.should_stop,
-                    self.config_dict,
-                    self.total_params, 
-                    shard_initial
+            if self.distributed:
+                # MODO DISTRIBUIDO: cada shard escucha en un puerto TCP
+                shard_port = self.base_port + shard_id
+                
+                # Colas locales para este shard
+                local_request_queue = queue.Queue()
+                local_response_queues: Dict[int, Queue] = {}
+                self.per_shard_response_queues[shard_id] = local_response_queues
+                
+                # Crear listener TCP
+                listener = ParameterServerListener(
+                    host=self.host,
+                    port=shard_port,
+                    request_queue=local_request_queue,
+                    response_queues=local_response_queues
                 )
-            )
-            p.start()
-            self.shard_processes.append(p)
-            
-            logger.info(
-                f"Shard {shard_id} lanzado: "
-                f"parámetros [{start_idx}:{end_idx}]"
-            )
+                listener.start()
+                
+                # El shard process lee de la cola local
+                p = mp.Process(
+                    target=parameter_server_shard_process,
+                    args=(
+                        shard_id,
+                        local_request_queue,  # Cola local
+                        local_response_queues,  # Colas locales
+                        None,  # No listener en el proceso (ya está aquí)
+                        None,
+                        self.should_stop,
+                        self.config_dict,
+                        self.total_params,
+                        shard_initial
+                    )
+                )
+                p.start()
+                self.shard_processes.append(p)
+                
+                logger.info(
+                    f"Shard {shard_id} en TCP {self.host}:{shard_port} "
+                    f"(params [{start_idx}:{end_idx}])"
+                )
+            else:
+                # MODO LOCAL: Queue compartida
+                p = mp.Process(
+                    target=parameter_server_shard_process,
+                    args=(
+                        shard_id,
+                        self.request_queues[shard_id],
+                        None,  # response_queues no usado en modo local directo
+                        None,  # No TCP listener
+                        None,
+                        self.should_stop,
+                        self.config_dict,
+                        self.total_params,
+                        shard_initial
+                    )
+                )
+                p.start()
+                self.shard_processes.append(p)
+                
+                logger.info(
+                    f"Shard {shard_id} en Queue local "
+                    f"(params [{start_idx}:{end_idx}])"
+                )
         
-        logger.info(
-            f"Todos los {self.config.num_shards} shards iniciados"
-        )
+        num_launched = len(self.shards_to_launch)
+        logger.info(f"Shards iniciados: {self.shards_to_launch} ({num_launched}/{self.config.num_shards})")
+        
+        # En modo local, agregar un thread para despachar responses
+        if not self.distributed:
+            self._response_dispatcher = threading.Thread(
+                target=self._dispatch_responses,
+                daemon=True
+            )
+            self._response_dispatcher.start()
+    
+    def _dispatch_responses(self):
+        """Thread que lee responses de cada shard y las centraliza."""
+        # En modo local, necesitamos leer de las colas de cada shard
+        # y depositar en response_queue central
+        # Por ahora, en modo local las réplicas leen directamente
+        pass
     
     def stop(self):
         """Detiene todos los shards del PS."""
@@ -409,12 +498,18 @@ class ParameterServerCoordinator:
         logger.info("Parameter Server detenido")
     
     def get_request_queue(self, shard_id: int) -> Queue:
-        """Retorna la cola de requests para un shard."""
+        """Retorna la cola de requests para un shard (modo local)."""
         return self.request_queues[shard_id]
     
     def get_response_queue(self) -> Queue:
-        """Retorna la cola de responses."""
+        """Retorna la cola de responses central (modo local)."""
         return self.response_queue
+    
+    def get_shard_endpoints(self) -> List[Tuple[str, int]]:
+        """Retorna los endpoints TCP para cada shard (modo distribuido)."""
+        if self.distributed:
+            return [(self.host, self.base_port + i) for i in range(self.config.num_shards)]
+        return []
     
     def save_checkpoint(self):
         """Solicita a todos los shards que guarden su estado."""
@@ -422,12 +517,11 @@ class ParameterServerCoordinator:
         for shard_id in range(self.config.num_shards):
             msg = Message(
                 msg_type=MessageType.SAVE_CHECKPOINT,
-                sender_id=-1,  # Coordinator
+                sender_id=-1,
                 data={}
             )
             self.request_queues[shard_id].put(msg)
         
-        # Esperar confirmaciones
         acks = 0
         while acks < self.config.num_shards:
             try:
@@ -450,7 +544,6 @@ class ParameterServerCoordinator:
             )
             self.request_queues[shard_id].put(msg)
         
-        # Esperar confirmaciones
         acks = 0
         while acks < self.config.num_shards:
             try:
@@ -461,26 +554,3 @@ class ParameterServerCoordinator:
                 break
         
         logger.info(f"Checkpoint cargado ({acks}/{self.config.num_shards} shards)")
-    
-    def get_stats(self) -> List[Dict]:
-        """Obtiene estadísticas de todos los shards."""
-        # Solicitar stats a cada shard
-        for shard_id in range(self.config.num_shards):
-            msg = Message(
-                msg_type=MessageType.GET_STATS,
-                sender_id=-1,
-                data={}
-            )
-            self.request_queues[shard_id].put(msg)
-        
-        # Recolectar respuestas
-        stats = []
-        for _ in range(self.config.num_shards):
-            try:
-                response = self.response_queue.get(block=True, timeout=2.0)
-                if response.msg_type == MessageType.STATS_RESPONSE:
-                    stats.append(response.data)
-            except queue.Empty:
-                break
-        
-        return stats

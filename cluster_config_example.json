@@ -1,0 +1,56 @@
+{
+  "description": "Configuracion de cluster DistBelief - PS Sharded Distribuido",
+  "parameter_server": {
+    "num_shards": 2,
+    "shard_endpoints": [
+      "192.168.1.10:29500",
+      "192.168.1.11:29500"
+    ]
+  },
+  "nodes": [
+    {
+      "node_id": 0,
+      "role": "ps",
+      "description": "Maquina A - Parameter Server Shard 0",
+      "num_replicas": 0,
+      "replica_offset": 0
+    },
+    {
+      "node_id": 1,
+      "role": "ps",
+      "description": "Maquina B - Parameter Server Shard 1",
+      "num_replicas": 0,
+      "replica_offset": 0
+    },
+    {
+      "node_id": 2,
+      "role": "replica",
+      "description": "Maquina C - 4 replicas",
+      "num_replicas": 4,
+      "replica_offset": 0
+    },
+    {
+      "node_id": 3,
+      "role": "replica",
+      "description": "Maquina D - 8 replicas",
+      "num_replicas": 8,
+      "replica_offset": 4
+    }
+  ],
+  "instructions": {
+    "setup": [
+      "1. Copiar este archivo como cluster.json y ajustar las IPs",
+      "2. En Maquina A (PS Shard 0): python train.py --role ps --shard-id 0 --num-shards 2 --ps-port-base 29500",
+      "3. En Maquina B (PS Shard 1): python train.py --role ps --shard-id 1 --num-shards 2 --ps-port-base 29500",
+      "4. En Maquina C (4 replicas): python train.py --role replica --shard-endpoints 192.168.1.10:29500,192.168.1.11:29500 --num-replicas 4",
+      "5. En Maquina D (8 replicas): python train.py --role replica --shard-endpoints 192.168.1.10:29500,192.168.1.11:29500 --num-replicas 8 --replica-offset 4"
+    ],
+    "notas": [
+      "Cada shard del PS corre en una maquina INDEPENDIENTE",
+      "Las replicas se conectan a TODOS los shards via --shard-endpoints",
+      "Los gradientes se dividen automaticamente entre shards segun el parametro"
+    ],
+    "firewall": "Asegurar que los puertos 29500-29510 estan abiertos entre TODAS las maquinas",
+    "dataset": "CIFAR-10 se descarga automaticamente en cada nodo replica"
+  }
+}
