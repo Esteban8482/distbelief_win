@@ -136,7 +136,9 @@ def parameter_server_shard_process(
     should_stop,
     config_dict: dict,
     total_params: int,
-    initial_parameters: Optional[torch.Tensor] = None
+    init_params_path: Optional[str] = None,
+    start_idx: int = 0,
+    end_idx: int = 0
 ):
     """
     Proceso para un shard del Parameter Server.
@@ -144,6 +146,10 @@ def parameter_server_shard_process(
     Funciona en dos modos:
     - LOCAL: request_queue y response_queues son multiprocessing.Queue
     - DISTRIBUIDO: listener_host/port especifican dónde escuchar TCP
+    
+    IMPORTANTE: Los parámetros iniciales se leen de un archivo
+    (init_params_path), NO se pasan como tensor. Los tensores de PyTorch
+    NO se serializan correctamente con pickle en Windows spawn.
     
     Args:
         shard_id: ID del shard
@@ -154,25 +160,33 @@ def parameter_server_shard_process(
         should_stop: Value compartido para señal de parada
         config_dict: Configuración serializada como dict
         total_params: Número total de parámetros del modelo
-        initial_parameters: Parámetros iniciales
+        init_params_path: Ruta al archivo .pt con parámetros iniciales
+        start_idx: Índice inicial del slice para este shard
+        end_idx: Índice final del slice para este shard
     """
     config = ParameterServerConfig(**config_dict)
     
     logger.info(f"Iniciando PS shard {shard_id}")
     
-    # Calcular límites del shard
-    start_idx, end_idx = get_parameter_shard_bounds(
-        total_params, config.num_shards, shard_id
-    )
+    # Calcular límites del shard (fallback si no se pasaron)
+    if end_idx == 0:
+        start_idx, end_idx = get_parameter_shard_bounds(
+            total_params, config.num_shards, shard_id
+        )
     
     # Crear el shard
     shard = ParameterShard(shard_id, start_idx, end_idx, config)
     
-    # Inicializar parámetros
-    if initial_parameters is not None:
-        shard_params = initial_parameters[start_idx:end_idx].clone()
+    # Inicializar parámetros desde archivo (mecanismo compatible con Windows spawn)
+    if init_params_path is not None and os.path.exists(init_params_path):
+        full_params = torch.load(init_params_path, weights_only=False)
+        shard_params = full_params[start_idx:end_idx].clone()
+        logger.info(f"Shard {shard_id}: Params cargados desde archivo "
+                    f"({start_idx}:{end_idx}, {len(shard_params)} params)")
     else:
         shard_params = torch.zeros(end_idx - start_idx)
+        logger.info(f"Shard {shard_id}: Params inicializados en cero "
+                    f"({start_idx}:{end_idx}, {len(shard_params)} params)")
     
     shard.initialize_parameters(shard_params)
     
@@ -389,18 +403,25 @@ class ParameterServerCoordinator:
     
     def start(self, initial_model_state: Optional[Dict] = None):
         """Inicia los procesos de los shards especificados en shards_to_launch."""
-        initial_params = None
+        # Guardar parámetros iniciales en archivo temporal
+        # Los tensores de PyTorch NO se pueden picklear correctamente en Windows spawn,
+        # así que guardamos todo el tensor en disco y los procesos hijos leen su slice.
+        init_params_path = None
         if initial_model_state is not None:
             initial_params = initial_model_state.get('parameters')
+            if initial_params is not None:
+                init_params_path = os.path.join(
+                    self.config.checkpoint_dir,
+                    "_init_params_shared.pt"
+                )
+                os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+                torch.save(initial_params, init_params_path)
+                logger.info(f"Parámetros iniciales guardados en {init_params_path}")
         
         for shard_id in self.shards_to_launch:
             start_idx, end_idx = get_parameter_shard_bounds(
                 self.total_params, self.config.num_shards, shard_id
             )
-            
-            shard_initial = None
-            if initial_params is not None:
-                shard_initial = initial_params[start_idx:end_idx]
             
             if self.distributed:
                 # MODO DISTRIBUIDO: el shard escucha en TCP
@@ -410,6 +431,8 @@ class ParameterServerCoordinator:
                 # En Windows con spawn(), queue.Queue y ParameterServerListener
                 # contienen locks que NO se pueden pickle.
                 # El listener y las colas se crean DENTRO del proceso hijo.
+                # Los parámetros iniciales se pasan vía archivo (path string),
+                # NO como tensor (no se picklea bien en Windows).
                 p = mp.Process(
                     target=parameter_server_shard_process,
                     args=(
@@ -421,7 +444,9 @@ class ParameterServerCoordinator:
                         self.should_stop,
                         self.config_dict,
                         self.total_params,
-                        shard_initial
+                        init_params_path,  # ruta al archivo (serializable)
+                        start_idx,         # índice para slice
+                        end_idx            # índice para slice
                     )
                 )
                 p.start()
@@ -444,7 +469,9 @@ class ParameterServerCoordinator:
                         self.should_stop,
                         self.config_dict,
                         self.total_params,
-                        shard_initial
+                        init_params_path,  # ruta al archivo (serializable)
+                        start_idx,         # índice para slice
+                        end_idx            # índice para slice
                     )
                 )
                 p.start()
